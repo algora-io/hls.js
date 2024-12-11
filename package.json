@@ -1,6 +1,6 @@
 {
   "name": "@algora/hls.js",
-  "version": "1.0.0",
+  "version": "1.5.17-algora.1",
   "license": "Apache-2.0",
   "description": "JavaScript HLS client using MediaSourceExtension",
   "homepage": "https://github.com/algora-io/hls.js",
