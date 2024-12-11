@@ -1,6 +1,5 @@
-import { logger } from './logger';
 import { adjustSliding } from './level-helper';
-
+import { logger } from './logger';
 import type { Fragment } from '../loader/fragment';
 import type { LevelDetails } from '../loader/level-details';
 
@@ -58,12 +57,10 @@ export function adjustSlidingStart(sliding: number, details: LevelDetails) {
  * The PTS of a fragment lets Hls.js know where it fits into a stream - by knowing every PTS, we know which fragment to
  * download at any given time. PTS is normally computed when the fragment is demuxed, so taking this step saves us time
  * and an extra download.
- * @param lastFrag
  * @param lastLevel
  * @param details
  */
 export function alignStream(
-  lastFrag: Fragment | null,
   switchDetails: LevelDetails | undefined,
   details: LevelDetails,
 ) {
@@ -81,7 +78,7 @@ export function alignStream(
     // Try to align on sn so that we pick a better start fragment.
     // Do not perform this on playlists with delta updates as this is only to align levels on switch
     // and adjustSliding only adjusts fragments after skippedSegments.
-    adjustSliding(switchDetails, details);
+    adjustSliding(switchDetails, details, false);
   }
 }
 

@@ -6,10 +6,23 @@
  * Uses loader(s) set in config to do actual internal loading of resource tasks.
  */
 
-import { Events } from '../events';
-import { ErrorDetails, ErrorTypes } from '../errors';
 import M3U8Parser from './m3u8-parser';
-import type { LevelParsed, VariableMap } from '../types/level';
+import { ErrorDetails, ErrorTypes } from '../errors';
+import { Events } from '../events';
+import { PlaylistContextType, PlaylistLevelType } from '../types/loader';
+import { AttrList } from '../utils/attr-list';
+import type { LevelDetails } from './level-details';
+import type { LoaderConfig, RetryConfig } from '../config';
+import type Hls from '../hls';
+import type { NetworkComponentAPI } from '../types/component-api';
+import type {
+  ErrorData,
+  LevelLoadingData,
+  LevelsUpdatedData,
+  ManifestLoadingData,
+  TrackLoadingData,
+} from '../types/events';
+import type { Level, LevelParsed, VariableMap } from '../types/level';
 import type {
   Loader,
   LoaderCallbacks,
@@ -19,19 +32,7 @@ import type {
   LoaderStats,
   PlaylistLoaderContext,
 } from '../types/loader';
-import { PlaylistContextType, PlaylistLevelType } from '../types/loader';
-import { LevelDetails } from './level-details';
-import { AttrList } from '../utils/attr-list';
-import type Hls from '../hls';
-import type {
-  ErrorData,
-  LevelLoadingData,
-  ManifestLoadingData,
-  TrackLoadingData,
-} from '../types/events';
-import type { NetworkComponentAPI } from '../types/component-api';
-import type { MediaAttributes } from '../types/media-playlist';
-import type { LoaderConfig, RetryConfig } from '../config';
+import type { MediaAttributes, MediaPlaylist } from '../types/media-playlist';
 
 function mapContextToLevelType(
   context: PlaylistLoaderContext,
@@ -86,6 +87,7 @@ class PlaylistLoader implements NetworkComponentAPI {
     hls.on(Events.LEVEL_LOADING, this.onLevelLoading, this);
     hls.on(Events.AUDIO_TRACK_LOADING, this.onAudioTrackLoading, this);
     hls.on(Events.SUBTITLE_TRACK_LOADING, this.onSubtitleTrackLoading, this);
+    hls.on(Events.LEVELS_UPDATED, this.onLevelsUpdated, this);
   }
 
   private unregisterListeners() {
@@ -94,6 +96,7 @@ class PlaylistLoader implements NetworkComponentAPI {
     hls.off(Events.LEVEL_LOADING, this.onLevelLoading, this);
     hls.off(Events.AUDIO_TRACK_LOADING, this.onAudioTrackLoading, this);
     hls.off(Events.SUBTITLE_TRACK_LOADING, this.onSubtitleTrackLoading, this);
+    hls.off(Events.LEVELS_UPDATED, this.onLevelsUpdated, this);
   }
 
   /**
@@ -118,7 +121,7 @@ class PlaylistLoader implements NetworkComponentAPI {
     return this.loaders[context.type];
   }
 
-  private resetInternalLoader(contextType): void {
+  private resetInternalLoader(contextType: PlaylistContextType): void {
     if (this.loaders[contextType]) {
       delete this.loaders[contextType];
     }
@@ -134,7 +137,7 @@ class PlaylistLoader implements NetworkComponentAPI {
         loader.destroy();
       }
 
-      this.resetInternalLoader(contextType);
+      this.resetInternalLoader(contextType as PlaylistContextType);
     }
   }
 
@@ -157,11 +160,12 @@ class PlaylistLoader implements NetworkComponentAPI {
       type: PlaylistContextType.MANIFEST,
       url,
       deliveryDirectives: null,
+      levelOrTrack: null,
     });
   }
 
   private onLevelLoading(event: Events.LEVEL_LOADING, data: LevelLoadingData) {
-    const { id, level, pathwayId, url, deliveryDirectives } = data;
+    const { id, level, pathwayId, url, deliveryDirectives, levelInfo } = data;
     this.load({
       id,
       level,
@@ -170,6 +174,7 @@ class PlaylistLoader implements NetworkComponentAPI {
       type: PlaylistContextType.LEVEL,
       url,
       deliveryDirectives,
+      levelOrTrack: levelInfo,
     });
   }
 
@@ -177,7 +182,7 @@ class PlaylistLoader implements NetworkComponentAPI {
     event: Events.AUDIO_TRACK_LOADING,
     data: TrackLoadingData,
   ) {
-    const { id, groupId, url, deliveryDirectives } = data;
+    const { id, groupId, url, deliveryDirectives, track } = data;
     this.load({
       id,
       groupId,
@@ -186,6 +191,7 @@ class PlaylistLoader implements NetworkComponentAPI {
       type: PlaylistContextType.AUDIO_TRACK,
       url,
       deliveryDirectives,
+      levelOrTrack: track,
     });
   }
 
@@ -193,7 +199,7 @@ class PlaylistLoader implements NetworkComponentAPI {
     event: Events.SUBTITLE_TRACK_LOADING,
     data: TrackLoadingData,
   ) {
-    const { id, groupId, url, deliveryDirectives } = data;
+    const { id, groupId, url, deliveryDirectives, track } = data;
     this.load({
       id,
       groupId,
@@ -202,7 +208,28 @@ class PlaylistLoader implements NetworkComponentAPI {
       type: PlaylistContextType.SUBTITLE_TRACK,
       url,
       deliveryDirectives,
+      levelOrTrack: track,
     });
+  }
+
+  private onLevelsUpdated(
+    event: Events.LEVELS_UPDATED,
+    data: LevelsUpdatedData,
+  ) {
+    // abort and delete loader of removed levels
+    const loader = this.loaders[PlaylistContextType.LEVEL];
+    if (loader) {
+      const context = loader.context;
+      if (
+        context &&
+        !data.levels.some(
+          (lvl) => lvl === (context as PlaylistLoaderContext).levelOrTrack,
+        )
+      ) {
+        loader.abort();
+        delete this.loaders[PlaylistContextType.LEVEL];
+      }
+    }
   }
 
   private load(context: PlaylistLoaderContext): void {
@@ -213,17 +240,27 @@ class PlaylistLoader implements NetworkComponentAPI {
     // Check if a loader for this context already exists
     let loader = this.getInternalLoader(context);
     if (loader) {
+      const logger = this.hls.logger;
       const loaderContext = loader.context as PlaylistLoaderContext;
       if (
         loaderContext &&
-        loaderContext.url === context.url &&
-        loaderContext.level === context.level
+        loaderContext.levelOrTrack === context.levelOrTrack &&
+        (loaderContext.url === context.url ||
+          (loaderContext.deliveryDirectives && !context.deliveryDirectives))
       ) {
-        // same URL can't overlap
-        this.hls.logger.trace('[playlist-loader]: playlist request ongoing');
+        // same URL can't overlap, or wait for blocking request
+        if (loaderContext.url === context.url) {
+          logger.log(
+            `[playlist-loader]: ignore ${context.url} ongoing request`,
+          );
+        } else {
+          logger.log(
+            `[playlist-loader]: ignore ${context.url} in favor of ${loaderContext.url}`,
+          );
+        }
         return;
       }
-      this.hls.logger.log(
+      logger.log(
         `[playlist-loader]: aborting previous loader for type: ${context.type}`,
       );
       loader.abort();
@@ -314,7 +351,10 @@ class PlaylistLoader implements NetworkComponentAPI {
         }
 
         stats.parsing.start = performance.now();
-        if (M3U8Parser.isMediaPlaylist(string)) {
+        if (
+          M3U8Parser.isMediaPlaylist(string) ||
+          context.type !== PlaylistContextType.MANIFEST
+        ) {
           this.handleTrackOrLevelPlaylist(
             response,
             stats,
@@ -349,6 +389,22 @@ class PlaylistLoader implements NetworkComponentAPI {
     // logger.debug(`[playlist-loader]: Calling internal loader delegate for URL: ${context.url}`);
 
     loader.load(context, loaderConfig, loaderCallbacks);
+  }
+
+  private checkAutostartLoad() {
+    if (!this.hls) {
+      return;
+    }
+    const {
+      config: { autoStartLoad, startPosition },
+      forceStartLoad,
+    } = this.hls;
+    if (autoStartLoad || forceStartLoad) {
+      this.hls.logger.log(
+        `${autoStartLoad ? 'auto' : 'force'} startLoad with configured startPosition ${startPosition}`,
+      );
+      this.hls.startLoad(startPosition);
+    }
   }
 
   private handleMasterPlaylist(
@@ -439,6 +495,8 @@ class PlaylistLoader implements NetworkComponentAPI {
       startTimeOffset,
       variableList,
     });
+
+    this.checkAutostartLoad();
   }
 
   private handleTrackOrLevelPlaylist(
@@ -458,7 +516,7 @@ class PlaylistLoader implements NetworkComponentAPI {
         ? (id as number)
         : 0;
     const levelType = mapContextToLevelType(context);
-    const levelDetails: LevelDetails = M3U8Parser.parseLevelPlaylist(
+    const levelDetails = M3U8Parser.parseLevelPlaylist(
       response.data as string,
       url,
       levelId,
@@ -508,6 +566,14 @@ class PlaylistLoader implements NetworkComponentAPI {
       networkDetails,
       loader,
     );
+
+    if (
+      type === PlaylistContextType.MANIFEST &&
+      (!levelDetails.playlistParsingError ||
+        (!levelDetails.fragments.length && levelDetails.live))
+    ) {
+      this.checkAutostartLoad();
+    }
   }
 
   private handleManifestParsingError(
@@ -627,7 +693,9 @@ class PlaylistLoader implements NetworkComponentAPI {
         ? (level as number)
         : undefined;
     if (!levelDetails.fragments.length) {
-      const error = new Error('No Segments found in Playlist');
+      const error = (levelDetails.playlistParsingError = new Error(
+        'No Segments found in Playlist',
+      ));
       hls.trigger(Events.ERROR, {
         type: ErrorTypes.NETWORK_ERROR,
         details: ErrorDetails.LEVEL_EMPTY_ERROR,
@@ -680,16 +748,19 @@ class PlaylistLoader implements NetworkComponentAPI {
       case PlaylistContextType.LEVEL:
         hls.trigger(Events.LEVEL_LOADED, {
           details: levelDetails,
+          levelInfo: (context.levelOrTrack as Level) || hls.levels[0],
           level: levelIndex || 0,
           id: id || 0,
           stats,
           networkDetails,
           deliveryDirectives,
+          withoutMultiVariant: type === PlaylistContextType.MANIFEST,
         });
         break;
       case PlaylistContextType.AUDIO_TRACK:
         hls.trigger(Events.AUDIO_TRACK_LOADED, {
           details: levelDetails,
+          track: context.levelOrTrack as MediaPlaylist,
           id: id || 0,
           groupId: groupId || '',
           stats,
@@ -700,6 +771,7 @@ class PlaylistLoader implements NetworkComponentAPI {
       case PlaylistContextType.SUBTITLE_TRACK:
         hls.trigger(Events.SUBTITLE_TRACK_LOADED, {
           details: levelDetails,
+          track: context.levelOrTrack as MediaPlaylist,
           id: id || 0,
           groupId: groupId || '',
           stats,

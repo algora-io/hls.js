@@ -1,26 +1,25 @@
+import { EventEmitter } from 'eventemitter3';
 import {
-  WorkerContext,
   hasUMDWorker,
   injectWorker,
   loadWorker,
   removeWorkerFromStore as removeWorkerClient,
 } from './inject-worker';
-import { Events } from '../events';
 import Transmuxer, {
+  isPromise,
   TransmuxConfig,
   TransmuxState,
-  isPromise,
 } from '../demux/transmuxer';
-import { ErrorTypes, ErrorDetails } from '../errors';
-import { EventEmitter } from 'eventemitter3';
-import { MediaFragment, Part } from '../loader/fragment';
+import { ErrorDetails, ErrorTypes } from '../errors';
+import { Events } from '../events';
+import { PlaylistLevelType } from '../types/loader';
 import { getM2TSSupportedAudioTypes } from '../utils/codecs';
-
-import type { ChunkMetadata, TransmuxerResult } from '../types/transmuxer';
-import type Hls from '../hls';
+import type { WorkerContext } from './inject-worker';
 import type { HlsEventEmitter, HlsListeners } from '../events';
+import type Hls from '../hls';
+import type { MediaFragment, Part } from '../loader/fragment';
 import type { ErrorData, FragDecryptedData } from '../types/events';
-import type { PlaylistLevelType } from '../types/loader';
+import type { ChunkMetadata, TransmuxerResult } from '../types/transmuxer';
 import type { RationalTimestamp } from '../utils/timescale-conversion';
 
 let transmuxerInstanceCount: number = 0;
@@ -235,7 +234,9 @@ export default class TransmuxerInterface {
     );
     if (!contiguous || discontinuity || initSegmentChange) {
       this.hls.logger
-        .log(`[transmuxer-interface, ${frag.type}]: Starting new transmux session for sn: ${chunkMeta.sn} p: ${chunkMeta.part} level: ${chunkMeta.level} id: ${chunkMeta.id}
+        .log(`[transmuxer-interface]: Starting new transmux session for ${frag.type} sn: ${chunkMeta.sn}${
+        chunkMeta.part > -1 ? ' part: ' + chunkMeta.part : ''
+      } ${this.id === PlaylistLevelType.MAIN ? 'level' : 'track'}: ${chunkMeta.level} id: ${chunkMeta.id}
         discontinuity: ${discontinuity}
         trackSwitch: ${trackSwitch}
         contiguous: ${contiguous}

@@ -1,16 +1,15 @@
-import Hls from '../../../src/hls';
-import { Events } from '../../../src/events';
+import chai from 'chai';
+import sinon from 'sinon';
+import sinonChai from 'sinon-chai';
+import { multivariantPlaylistWithRedundantFallbacks } from './level-controller';
 import { ErrorDetails, ErrorTypes } from '../../../src/errors';
+import { Events } from '../../../src/events';
+import Hls from '../../../src/hls';
 import type {
   ErrorData,
   FragLoadedData,
   LevelSwitchingData,
 } from '../../../src/types/events';
-
-import sinon from 'sinon';
-import chai from 'chai';
-import sinonChai from 'sinon-chai';
-import { multivariantPlaylistWithRedundantFallbacks } from './level-controller';
 
 chai.use(sinonChai);
 const expect = chai.expect;
@@ -267,7 +266,9 @@ describe('ErrorController Integration Tests', function () {
       hls.loadSource('noSegmentsVod.m3u8');
       hls.stopLoad.should.have.been.calledOnce;
       return new Promise((resolve, reject) => {
-        hls.on(Events.ERROR, (event, data) => resolve(data));
+        hls.on(Events.ERROR, (event, data) =>
+          Promise.resolve().then(() => resolve(data)),
+        );
         hls.on(Events.LEVEL_LOADED, () =>
           reject(
             new Error(

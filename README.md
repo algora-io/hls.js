@@ -86,20 +86,18 @@ For details on the HLS format and these tags' meanings, see https://datatracker.
 - `#EXT-X-CONTENT-STEERING:<attribute-list>` Content Steering
 - `#EXT-X-DEFINE:<attribute-list>` Variable Substitution (`NAME,VALUE,QUERYPARAM` attributes)
 
-The following properties are added to their respective variants' attribute list but are not implemented in their selection and playback.
-
-- `VIDEO-RANGE` (See [#2489](https://github.com/video-dev/hls.js/issues/2489))
-
 #### Media Playlist tags
 
-- `#EXTM3U`
-- `#EXT-X-VERSION=<n>`
+- `#EXTM3U` (ignored)
+- `#EXT-X-INDEPENDENT-SEGMENTS` (ignored)
+- `#EXT-X-VERSION=<n>` (value is ignored)
 - `#EXTINF:<duration>,[<title>]`
 - `#EXT-X-ENDLIST`
 - `#EXT-X-MEDIA-SEQUENCE=<n>`
 - `#EXT-X-TARGETDURATION=<n>`
 - `#EXT-X-DISCONTINUITY`
 - `#EXT-X-DISCONTINUITY-SEQUENCE=<n>`
+- `#EXT-X-BITRATE`
 - `#EXT-X-BYTERANGE=<n>[@<o>]`
 - `#EXT-X-MAP:<attribute-list>`
 - `#EXT-X-KEY:<attribute-list>` (`KEYFORMAT="identity",METHOD=SAMPLE-AES` is only supports with MPEG-2 TS segments)
@@ -111,14 +109,11 @@ The following properties are added to their respective variants' attribute list 
 - `#EXT-X-SKIP:<attribute-list>` Delta Playlists
 - `#EXT-X-RENDITION-REPORT:<attribute-list>`
 - `#EXT-X-DATERANGE:<attribute-list>` Metadata
+  - HLS EXT-X-DATERANGE Schema for Interstitials
 - `#EXT-X-DEFINE:<attribute-list>` Variable Import and Substitution (`NAME,VALUE,IMPORT,QUERYPARAM` attributes)
 - `#EXT-X-GAP` (Skips loading GAP segments and parts. Skips playback of unbuffered program containing only GAP content and no suitable alternates. See [#2940](https://github.com/video-dev/hls.js/issues/2940))
 
-The following tags are added to their respective fragment's attribute list but are not implemented in streaming and playback.
-
-- `#EXT-X-BITRATE` (Not used in ABR controller)
-
-Parsed but missing feature support
+Parsed but missing feature support:
 
 - `#EXT-X-PRELOAD-HINT:<attribute-list>` (See [#5074](https://github.com/video-dev/hls.js/issues/3988))
   - #5074
@@ -127,8 +122,8 @@ Parsed but missing feature support
 
 For a complete list of issues, see ["Top priorities" in the Release Planning and Backlog project tab](https://github.com/video-dev/hls.js/projects/6). Codec support is dependent on the runtime environment (for example, not all browsers on the same OS support HEVC).
 
-- HLS Interstitials
 - `#EXT-X-I-FRAME-STREAM-INF` I-frame Media Playlist files
+- `REQ-VIDEO-LAYOUT` is not used in variant filtering or selection
 - "identity" format `SAMPLE-AES` method keys with fmp4, aac, mp3, vtt... segments (MPEG-2 TS only)
 - MPEG-2 TS segments with FairPlay Streaming, PlayReady, or Widevine encryption
 - FairPlay Streaming legacy keys (For com.apple.fps.1_0 use native Safari playback)
@@ -393,6 +388,28 @@ To check for native browser support first and then fallback to HLS.js, swap thes
 </script>
 ```
 
+#### Ensure correct time in video
+
+HLS transcoding of an original video file often pushes the time of the first frame a bit. If you depend on having an exact match of frame times between original video and HLS stream, you need to account for this:
+
+```javascript
+let tOffset = 0;
+const getAppendedOffset = (eventName, { frag }) => {
+  if (frag.type === 'main' && frag.sn !== 'initSegment' && frag.elementaryStreams.video) {
+    const { start, startDTS, startPTS, maxStartPTS, elementaryStreams } = frag;
+    tOffset = elementaryStreams.video.startPTS - start;
+    hls.off(Hls.Events.BUFFER_APPENDED, getAppendedOffset);
+    console.log('video timestamp offset:', tOffset, { start, startDTS, startPTS, maxStartPTS, elementaryStreams });
+  }
+}
+hls.on(Hls.Events.BUFFER_APPENDED, getAppendedOffset);
+// and account for this offset, for example like this:
+const video = document.querySelector('video');
+video.addEventListener('timeupdate', () => setTime(Math.max(0, video.currentTime - tOffset))
+const seek = (t) => video.currentTime = t + tOffset;
+const getDuration = () => video.duration - tOffset;
+```
+
 For more embed and API examples see [docs/API.md](./docs/API.md).
 
 ## CORS
@@ -425,6 +442,7 @@ The following players integrate HLS.js for HLS playback:
 - [OpenPlayerJS](https://www.openplayerjs.com), as part of the [OpenPlayer project](https://github.com/openplayerjs)
 - [CDNBye](https://github.com/cdnbye/hlsjs-p2p-engine), a p2p engine for hls.js powered by WebRTC Datachannel.
 - [M3U IPTV](http://m3u-ip.tv/browser/)
+- [ArtPlayer](https://artplayer.org/?libs=https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.17/hls.min.js&example=hls)
 
 ### They use HLS.js in production!
 

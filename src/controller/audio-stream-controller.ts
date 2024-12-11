@@ -1,47 +1,47 @@
 import BaseStreamController, { State } from './base-stream-controller';
-import { Events } from '../events';
+import { findFragWithCC, findNearestWithCC } from './fragment-finders';
 import { FragmentState } from './fragment-tracker';
-import { Level } from '../types/level';
-import { PlaylistContextType, PlaylistLevelType } from '../types/loader';
-import {
-  Fragment,
-  ElementaryStreamTypes,
-  Part,
-  MediaFragment,
-} from '../loader/fragment';
 import ChunkCache from '../demux/chunk-cache';
 import TransmuxerInterface from '../demux/transmuxer-interface';
-import { ChunkMetadata } from '../types/transmuxer';
-import { findFragWithCC, findNearestWithCC } from './fragment-finders';
-import { alignMediaPlaylistByPDT } from '../utils/discontinuities';
-import { mediaAttributesIdentical } from '../utils/media-option-attributes';
 import { ErrorDetails } from '../errors';
-import type { NetworkComponentAPI } from '../types/component-api';
-import type Hls from '../hls';
+import { Events } from '../events';
+import { ElementaryStreamTypes, isMediaFragment } from '../loader/fragment';
+import { Level } from '../types/level';
+import { PlaylistContextType, PlaylistLevelType } from '../types/loader';
+import { ChunkMetadata } from '../types/transmuxer';
+import {
+  alignDiscontinuities,
+  alignMediaPlaylistByPDT,
+} from '../utils/discontinuities';
+import { mediaAttributesIdentical } from '../utils/media-option-attributes';
 import type { FragmentTracker } from './fragment-tracker';
+import type Hls from '../hls';
+import type { Fragment, MediaFragment, Part } from '../loader/fragment';
 import type KeyLoader from '../loader/key-loader';
-import type { TransmuxerResult } from '../types/transmuxer';
 import type { LevelDetails } from '../loader/level-details';
-import type { TrackSet } from '../types/track';
+import type { NetworkComponentAPI } from '../types/component-api';
 import type {
-  BufferCreatedData,
   AudioTracksUpdatedData,
   AudioTrackSwitchingData,
-  LevelLoadedData,
-  TrackLoadedData,
   BufferAppendingData,
+  BufferCodecsData,
+  BufferCreatedData,
   BufferFlushedData,
-  InitPTSFoundData,
+  BufferFlushingData,
+  ErrorData,
+  FragBufferedData,
   FragLoadedData,
+  FragLoadingData,
   FragParsingMetadataData,
   FragParsingUserdataData,
-  FragBufferedData,
-  ErrorData,
-  BufferFlushingData,
-  BufferCodecsData,
-  FragLoadingData,
+  InitPTSFoundData,
+  LevelLoadedData,
+  MediaDetachingData,
+  TrackLoadedData,
 } from '../types/events';
 import type { MediaPlaylist } from '../types/media-playlist';
+import type { TrackSet } from '../types/track';
+import type { TransmuxerResult } from '../types/transmuxer';
 
 const TICK_INTERVAL = 100; // how often to tick in ms
 
@@ -56,8 +56,9 @@ class AudioStreamController
   extends BaseStreamController
   implements NetworkComponentAPI
 {
-  private videoAnchor: MediaFragment | null = null;
+  private mainAnchor: MediaFragment | null = null;
   private mainFragLoading: FragLoadingData | null = null;
+  private audioOnly: boolean = false;
   private bufferedTrack: MediaPlaylist | null = null;
   private switchingTrack: MediaPlaylist | null = null;
   private trackId: number = -1;
@@ -85,9 +86,18 @@ class AudioStreamController
   protected onHandlerDestroying() {
     this.unregisterListeners();
     super.onHandlerDestroying();
-    this.mainDetails = null;
-    this.bufferedTrack = null;
-    this.switchingTrack = null;
+    this.resetItem();
+  }
+
+  private resetItem() {
+    this.mainDetails =
+      this.mainAnchor =
+      this.mainFragLoading =
+      this.bufferedTrack =
+      this.switchingTrack =
+      this.waitingData =
+      this.cachedTrackLoadedData =
+        null;
   }
 
   protected registerListeners() {
@@ -121,7 +131,7 @@ class AudioStreamController
     hls.off(Events.BUFFER_FLUSHING, this.onBufferFlushing, this);
     hls.off(Events.BUFFER_FLUSHED, this.onBufferFlushed, this);
     hls.off(Events.INIT_PTS_FOUND, this.onInitPtsFound, this);
-    hls.on(Events.FRAG_LOADING, this.onFragLoading, this);
+    hls.off(Events.FRAG_LOADING, this.onFragLoading, this);
     hls.off(Events.FRAG_BUFFERED, this.onFragBuffered, this);
   }
 
@@ -139,16 +149,19 @@ class AudioStreamController
       this.log(
         `InitPTS for cc: ${cc} found from main: ${initPTS}/${timescale}`,
       );
-      this.videoAnchor = frag;
+      this.mainAnchor = frag;
       // If we are waiting, tick immediately to unblock audio fragment transmuxing
       if (this.state === State.WAITING_INIT_PTS) {
         const waitingData = this.waitingData;
-        if (!waitingData || waitingData.frag.cc !== cc) {
+        if (
+          (!waitingData && !this.loadingParts) ||
+          (waitingData && waitingData.frag.cc !== cc)
+        ) {
           this.nextLoadPosition = this.findSyncFrag(frag).start;
         }
         this.tick();
       } else if (
-        !this.loadedmetadata &&
+        !this.hls.hasEnoughToStart &&
         inFlightFrag &&
         inFlightFrag.cc !== cc
       ) {
@@ -156,6 +169,8 @@ class AudioStreamController
         this.nextLoadPosition = this.findSyncFrag(frag).start;
         inFlightFrag.abortRequests();
         this.resetLoadingState();
+      } else if (this.state === State.IDLE) {
+        this.tick();
       }
     }
   }
@@ -188,7 +203,6 @@ class AudioStreamController
       startPosition = lastCurrentTime;
       this.state = State.IDLE;
     } else {
-      this.loadedmetadata = false;
       this.state = State.WAITING_TRACK;
     }
     this.nextLoadPosition =
@@ -206,8 +220,9 @@ class AudioStreamController
         break;
       case State.WAITING_TRACK: {
         const { levels, trackId } = this;
-        const details = levels?.[trackId]?.details;
-        if (details) {
+        const currenTrack = levels?.[trackId];
+        const details = currenTrack?.details;
+        if (details && !this.waitForLive(currenTrack)) {
           if (this.waitForCdnTuneIn(details)) {
             break;
           }
@@ -232,11 +247,11 @@ class AudioStreamController
         const waitingData = this.waitingData;
         if (waitingData) {
           const { frag, part, cache, complete } = waitingData;
-          const videoAnchor = this.videoAnchor;
+          const mainAnchor = this.mainAnchor;
           if (this.initPTS[frag.cc] !== undefined) {
             this.waitingData = null;
             this.state = State.FRAG_LOADING;
-            const payload = cache.flush();
+            const payload = cache.flush().buffer;
             const data: FragLoadedData = {
               frag,
               part,
@@ -247,15 +262,15 @@ class AudioStreamController
             if (complete) {
               super._handleFragmentLoadComplete(data);
             }
-          } else if (videoAnchor && videoAnchor.cc !== waitingData.frag.cc) {
+          } else if (mainAnchor && mainAnchor.cc !== waitingData.frag.cc) {
             // Drop waiting fragment if videoTrackCC has changed since waitingFragment was set and initPTS was not found
             this.log(
-              `Waiting fragment cc (${frag.cc}) cancelled because video is at cc ${videoAnchor.cc}`,
+              `Waiting fragment cc (${frag.cc}) cancelled because video is at cc ${mainAnchor.cc}`,
             );
-            this.nextLoadPosition = this.findSyncFrag(videoAnchor).start;
+            this.nextLoadPosition = this.findSyncFrag(mainAnchor).start;
             this.clearWaitingFragment();
           }
-        } else if (this.state !== State.STOPPED) {
+        } else {
           this.state = State.IDLE;
         }
       }
@@ -267,7 +282,7 @@ class AudioStreamController
   clearWaitingFragment() {
     const waitingData = this.waitingData;
     if (waitingData) {
-      if (!this.loadedmetadata) {
+      if (!this.hls.hasEnoughToStart) {
         // Load overlapping fragment on start when discontinuity start times are not aligned
         this.startFragRequested = false;
       }
@@ -317,10 +332,11 @@ class AudioStreamController
     const trackDetails = levelInfo.details;
     if (
       !trackDetails ||
-      (trackDetails.live && this.levelLastLoaded !== levelInfo) ||
+      this.waitForLive(levelInfo) ||
       this.waitForCdnTuneIn(trackDetails)
     ) {
       this.state = State.WAITING_TRACK;
+      this.startFragRequested = false;
       return;
     }
 
@@ -406,10 +422,11 @@ class AudioStreamController
     // Request audio segments up to one fragment ahead of main stream-controller
     const mainFragLoading = this.mainFragLoading?.frag;
     if (
+      !this.audioOnly &&
       this.startFragRequested &&
       mainFragLoading &&
-      mainFragLoading.sn !== 'initSegment' &&
-      frag.sn !== 'initSegment' &&
+      isMediaFragment(mainFragLoading) &&
+      isMediaFragment(frag) &&
       !frag.endList &&
       (!trackDetails.live ||
         (!this.loadingParts && targetBufferTime < this.hls.liveSyncPosition!))
@@ -438,9 +455,12 @@ class AudioStreamController
     this.loadFragment(frag, levelInfo, targetBufferTime);
   }
 
-  protected onMediaDetaching() {
+  protected onMediaDetaching(
+    event: Events.MEDIA_DETACHING,
+    data: MediaDetachingData,
+  ) {
     this.bufferFlushed = this.flushing = false;
-    super.onMediaDetaching();
+    super.onMediaDetaching(event, data);
   }
 
   private onAudioTracksUpdated(
@@ -489,22 +509,17 @@ class AudioStreamController
 
   protected onManifestLoading() {
     super.onManifestLoading();
-    this.bufferFlushed = this.flushing = false;
-    this.mainDetails =
-      this.waitingData =
-      this.videoAnchor =
-      this.bufferedTrack =
-      this.cachedTrackLoadedData =
-      this.switchingTrack =
-        null;
+    this.bufferFlushed = this.flushing = this.audioOnly = false;
+    this.resetItem();
     this.trackId = -1;
   }
 
   private onLevelLoaded(event: Events.LEVEL_LOADED, data: LevelLoadedData) {
     this.mainDetails = data.details;
-    if (this.cachedTrackLoadedData !== null) {
-      this.hls.trigger(Events.AUDIO_TRACK_LOADED, this.cachedTrackLoadedData);
+    const cachedTrackLoadedData = this.cachedTrackLoadedData;
+    if (cachedTrackLoadedData) {
       this.cachedTrackLoadedData = null;
+      this.hls.trigger(Events.AUDIO_TRACK_LOADED, cachedTrackLoadedData);
     }
   }
 
@@ -512,12 +527,20 @@ class AudioStreamController
     event: Events.AUDIO_TRACK_LOADED,
     data: TrackLoadedData,
   ) {
-    if (this.mainDetails == null) {
-      this.cachedTrackLoadedData = data;
-      return;
-    }
     const { levels } = this;
     const { details: newDetails, id: trackId } = data;
+    const mainDetails = this.mainDetails;
+    if (
+      !mainDetails ||
+      mainDetails.expired ||
+      newDetails.endCC > mainDetails.endCC
+    ) {
+      this.cachedTrackLoadedData = data;
+      if (this.state !== State.STOPPED) {
+        this.state = State.WAITING_TRACK;
+      }
+      return;
+    }
     if (!levels) {
       this.warn(`Audio tracks were reset while loading level ${trackId}`);
       return;
@@ -542,30 +565,38 @@ class AudioStreamController
       if (newDetails.deltaUpdateFailed || !mainDetails) {
         return;
       }
-      if (
-        !track.details &&
-        newDetails.hasProgramDateTime &&
-        mainDetails.hasProgramDateTime
-      ) {
-        // Make sure our audio rendition is aligned with the "main" rendition, using
-        // pdt as our reference times.
-        alignMediaPlaylistByPDT(newDetails, mainDetails);
-        sliding = newDetails.fragments[0].start;
-      } else {
+
+      if (track.details) {
         sliding = this.alignPlaylists(
           newDetails,
           track.details,
           this.levelLastLoaded?.details,
         );
       }
+      if (!newDetails.alignedSliding) {
+        // Align audio rendition with the "main" playlist on discontinuity change
+        // or program-date-time (PDT)
+        alignDiscontinuities(newDetails, mainDetails);
+        if (!newDetails.alignedSliding) {
+          alignMediaPlaylistByPDT(newDetails, mainDetails);
+        }
+        sliding = newDetails.fragmentStart;
+      }
     }
     track.details = newDetails;
     this.levelLastLoaded = track;
 
     // compute start position if we are aligned with the main playlist
-    if (!this.startFragRequested && (this.mainDetails || !newDetails.live)) {
-      this.setStartPosition(this.mainDetails || newDetails, sliding);
+    if (!this.startFragRequested) {
+      this.setStartPosition(mainDetails, sliding);
     }
+
+    this.hls.trigger(Events.AUDIO_TRACK_UPDATED, {
+      details: newDetails,
+      id: trackId,
+      groupId: data.groupId,
+    });
+
     // only switch back to IDLE state if we were waiting for track to start downloading a new fragment
     if (
       this.state === State.WAITING_TRACK &&
@@ -654,7 +685,9 @@ class AudioStreamController
         complete: false,
       });
       cache.push(new Uint8Array(payload));
-      this.state = State.WAITING_INIT_PTS;
+      if (this.state !== State.STOPPED) {
+        this.state = State.WAITING_INIT_PTS;
+      }
     }
   }
 
@@ -669,13 +702,13 @@ class AudioStreamController
   private onBufferReset(/* event: Events.BUFFER_RESET */) {
     // reset reference to sourcebuffers
     this.mediaBuffer = null;
-    this.loadedmetadata = false;
   }
 
   private onBufferCreated(
     event: Events.BUFFER_CREATED,
     data: BufferCreatedData,
   ) {
+    this.bufferFlushed = this.flushing = false;
     const audioTrack = data.tracks.audio;
     if (audioTrack) {
       this.mediaBuffer = audioTrack.buffer || null;
@@ -684,8 +717,9 @@ class AudioStreamController
 
   private onFragLoading(event: Events.FRAG_LOADING, data: FragLoadingData) {
     if (
+      !this.audioOnly &&
       data.frag.type === PlaylistLevelType.MAIN &&
-      data.frag.sn !== 'initSegment'
+      isMediaFragment(data.frag)
     ) {
       this.mainFragLoading = data;
       if (this.state === State.IDLE) {
@@ -697,14 +731,14 @@ class AudioStreamController
   private onFragBuffered(event: Events.FRAG_BUFFERED, data: FragBufferedData) {
     const { frag, part } = data;
     if (frag.type !== PlaylistLevelType.AUDIO) {
-      if (!this.loadedmetadata && frag.type === PlaylistLevelType.MAIN) {
-        const bufferedState = this.fragmentTracker.getState(frag);
-        if (
-          bufferedState === FragmentState.OK ||
-          bufferedState === FragmentState.PARTIAL
-        ) {
-          this.loadedmetadata = true;
-        }
+      if (
+        !this.audioOnly &&
+        frag.type === PlaylistLevelType.MAIN &&
+        !frag.elementaryStreams.video &&
+        !frag.elementaryStreams.audiovideo
+      ) {
+        this.audioOnly = true;
+        this.mainFragLoading = null;
       }
       return;
     }
@@ -722,8 +756,8 @@ class AudioStreamController
       );
       return;
     }
-    if (frag.sn !== 'initSegment') {
-      this.fragPrevious = frag as MediaFragment;
+    if (isMediaFragment(frag)) {
+      this.fragPrevious = frag;
       const track = this.switchingTrack;
       if (track) {
         this.bufferedTrack = track;
@@ -732,6 +766,9 @@ class AudioStreamController
       }
     }
     this.fragBufferedComplete(frag, part);
+    if (this.media) {
+      this.tick();
+    }
   }
 
   protected onError(event: Events.ERROR, data: ErrorData) {
@@ -959,7 +996,7 @@ class AudioStreamController
       fragState === FragmentState.NOT_LOADED ||
       fragState === FragmentState.PARTIAL
     ) {
-      if (frag.sn === 'initSegment') {
+      if (!isMediaFragment(frag)) {
         this._loadInitSegment(frag, track);
       } else if (track.details?.live && !this.initPTS[frag.cc]) {
         this.log(
@@ -969,7 +1006,7 @@ class AudioStreamController
         const mainDetails = this.mainDetails;
         if (
           mainDetails &&
-          mainDetails.fragments[0].start !== track.details.fragments[0].start
+          mainDetails.fragmentStart !== track.details.fragmentStart
         ) {
           alignMediaPlaylistByPDT(track.details, mainDetails);
         }

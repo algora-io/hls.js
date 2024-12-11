@@ -38,19 +38,19 @@ function updateFromToPTS(fragFrom: MediaFragment, fragTo: MediaFragment) {
       frag = fragTo;
     }
     if (frag.duration !== duration) {
-      frag.duration = duration;
+      frag.setDuration(duration);
     }
     // we dont know startPTS[toIdx]
   } else if (fragTo.sn > fragFrom.sn) {
     const contiguous = fragFrom.cc === fragTo.cc;
     // TODO: With part-loading end/durations we need to confirm the whole fragment is loaded before using (or setting) minEndPTS
     if (contiguous && fragFrom.minEndPTS) {
-      fragTo.start = fragFrom.start + (fragFrom.minEndPTS - fragFrom.start);
+      fragTo.setStart(fragFrom.start + (fragFrom.minEndPTS - fragFrom.start));
     } else {
-      fragTo.start = fragFrom.start + fragFrom.duration;
+      fragTo.setStart(fragFrom.start + fragFrom.duration);
     }
   } else {
-    fragTo.start = Math.max(fragFrom.start - fragTo.duration, 0);
+    fragTo.setStart(Math.max(fragFrom.start - fragTo.duration, 0));
   }
 }
 
@@ -92,9 +92,9 @@ export function updateFragPTSDTS(
 
   const drift = startPTS - frag.start;
   if (frag.start !== 0) {
-    frag.start = startPTS;
+    frag.setStart(startPTS);
   }
-  frag.duration = endPTS - frag.start;
+  frag.setDuration(endPTS - frag.start);
   frag.startPTS = startPTS;
   frag.maxStartPTS = maxStartPTS;
   frag.startDTS = startDTS;
@@ -170,15 +170,14 @@ export function mergeDetails(
         Number.isFinite(oldFrag.startPTS) &&
         Number.isFinite(oldFrag.endPTS)
       ) {
-        newFrag.start = newFrag.startPTS = oldFrag.startPTS as number;
+        newFrag.setStart((newFrag.startPTS = oldFrag.startPTS!));
         newFrag.startDTS = oldFrag.startDTS;
         newFrag.maxStartPTS = oldFrag.maxStartPTS;
 
         newFrag.endPTS = oldFrag.endPTS;
         newFrag.endDTS = oldFrag.endDTS;
         newFrag.minEndPTS = oldFrag.minEndPTS;
-        newFrag.duration =
-          (oldFrag.endPTS as number) - (oldFrag.startPTS as number);
+        newFrag.setDuration(oldFrag.endPTS! - oldFrag.startPTS!);
 
         if (newFrag.duration) {
           PTSFrag = newFrag;
@@ -187,9 +186,17 @@ export function mergeDetails(
         // PTS is known when any segment has startPTS and endPTS
         newDetails.PTSKnown = newDetails.alignedSliding = true;
       }
-      newFrag.elementaryStreams = oldFrag.elementaryStreams;
+
+      if (oldFrag.hasStreams) {
+        newFrag.elementaryStreams = oldFrag.elementaryStreams;
+      }
+
       newFrag.loader = oldFrag.loader;
-      newFrag.stats = oldFrag.stats;
+
+      if (oldFrag.hasStats) {
+        newFrag.stats = oldFrag.stats;
+      }
+
       if (oldFrag.initSegment) {
         newFrag.initSegment = oldFrag.initSegment;
         currentInitSegment = oldFrag.initSegment;
@@ -222,7 +229,9 @@ export function mergeDetails(
         newDetails.fragments.shift();
       }
       newDetails.startSN = newDetails.fragments[0].sn;
-      newDetails.startCC = newDetails.fragments[0].cc;
+      if (!newDetails.startCC) {
+        newDetails.startCC = newDetails.fragments[0].cc;
+      }
     } else {
       if (newDetails.canSkipDateRanges) {
         newDetails.dateRanges = mergeDateRanges(
@@ -305,6 +314,9 @@ export function mergeDetails(
     newDetails.driftEndTime = oldDetails.driftEndTime;
     newDetails.driftEnd = oldDetails.driftEnd;
     newDetails.advancedDateTime = oldDetails.advancedDateTime;
+  }
+  if (newDetails.requestScheduled === -1) {
+    newDetails.requestScheduled = oldDetails.requestScheduled;
   }
 }
 
@@ -407,24 +419,38 @@ export function mapFragmentIntersection(
 export function adjustSliding(
   oldDetails: LevelDetails,
   newDetails: LevelDetails,
+  matchingStableVariantOrRendition: boolean = true,
 ): void {
   const delta =
     newDetails.startSN + newDetails.skippedSegments - oldDetails.startSN;
   const oldFragments = oldDetails.fragments;
-  if (delta < 0 || delta >= oldFragments.length) {
+  const advancedOrStable = delta >= 0;
+  let sliding = 0;
+  if (advancedOrStable && delta < oldFragments.length) {
+    sliding = oldFragments[delta].start;
+  } else if (advancedOrStable && newDetails.startSN === oldDetails.endSN + 1) {
+    sliding = oldDetails.fragmentEnd;
+  } else if (advancedOrStable && matchingStableVariantOrRendition) {
+    // align with expected position (updated playlist start sequence is past end sequence of last update)
+    sliding = oldDetails.fragmentStart + delta * newDetails.levelTargetDuration;
+  } else if (!newDetails.skippedSegments && newDetails.fragmentStart === 0) {
+    // align new start with old (playlist switch has a sequence with no overlap and should not be used for alignment)
+    sliding = oldDetails.fragmentStart;
+  } else {
+    // new details already has a sliding offset or has skipped segments
     return;
   }
-  addSliding(newDetails, oldFragments[delta].start);
+  addSliding(newDetails, sliding);
 }
 
-export function addSliding(details: LevelDetails, start: number) {
-  if (start) {
+export function addSliding(details: LevelDetails, sliding: number) {
+  if (sliding) {
     const fragments = details.fragments;
     for (let i = details.skippedSegments; i < fragments.length; i++) {
-      fragments[i].start += start;
+      fragments[i].addStart(sliding);
     }
     if (details.fragmentHint) {
-      details.fragmentHint.start += start;
+      details.fragmentHint.addStart(sliding);
     }
   }
 }
@@ -512,10 +538,13 @@ export function findPart(
 
 export function reassignFragmentLevelIndexes(levels: Level[]) {
   levels.forEach((level, index) => {
-    const { details } = level;
-    if (details?.fragments) {
-      details.fragments.forEach((fragment) => {
+    const fragments = level.details?.fragments;
+    if (fragments) {
+      fragments.forEach((fragment) => {
         fragment.level = index;
+        if (fragment.initSegment) {
+          fragment.initSegment.level = index;
+        }
       });
     }
   });

@@ -1,7 +1,7 @@
-import type { Fragment, MediaFragment, Part } from './fragment';
 import type { DateRange } from './date-range';
-import type { AttrList } from '../utils/attr-list';
+import type { Fragment, MediaFragment, Part } from './fragment';
 import type { VariableMap } from '../types/level';
+import type { AttrList } from '../utils/attr-list';
 
 const DEFAULT_TARGET_DURATION = 10;
 
@@ -20,6 +20,7 @@ export class LevelDetails {
   public dateRanges: Record<string, DateRange>;
   public dateRangeTagCount: number = 0;
   public live: boolean = true;
+  public requestScheduled: number = -1;
   public ageHeader: number = 0;
   public advancedDateTime?: number;
   public updated: boolean = true;
@@ -56,6 +57,7 @@ export class LevelDetails {
   public playlistParsingError: Error | null = null;
   public variableList: VariableMap | null = null;
   public hasVariableRefs = false;
+  public appliedTimelineOffset?: number;
 
   constructor(baseUrl: string) {
     this.fragments = [];
@@ -134,6 +136,13 @@ export class LevelDetails {
     return 0;
   }
 
+  get fragmentStart(): number {
+    if (this.fragments?.length) {
+      return this.fragments[0].start;
+    }
+    return 0;
+  }
+
   get age(): number {
     if (this.advancedDateTime) {
       return Math.max(Date.now() - this.advancedDateTime, 0) / 1000;
@@ -148,10 +157,38 @@ export class LevelDetails {
     return -1;
   }
 
+  get maxPartIndex(): number {
+    const partList = this.partList;
+    if (partList) {
+      const lastIndex = this.lastPartIndex;
+      if (lastIndex !== -1) {
+        for (let i = partList.length; i--; ) {
+          if (partList[i].index > lastIndex) {
+            return partList[i].index;
+          }
+        }
+        return lastIndex;
+      }
+    }
+    return 0;
+  }
+
   get lastPartSn(): number {
     if (this.partList?.length) {
       return this.partList[this.partList.length - 1].fragment.sn;
     }
     return this.endSN;
+  }
+
+  get expired(): boolean {
+    if (this.live && this.age) {
+      const playlistWindowDuration = this.partEnd - this.fragmentStart;
+      return (
+        this.age >
+        Math.max(playlistWindowDuration, this.totalduration) +
+          this.levelTargetDuration
+      );
+    }
+    return false;
   }
 }

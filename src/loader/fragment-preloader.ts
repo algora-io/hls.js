@@ -1,15 +1,14 @@
 import FragmentLoader from './fragment-loader';
-import { Fragment, Part } from './fragment';
-
-import {
+import { logger } from '../utils/logger';
+import type { Fragment, Part } from './fragment';
+import type { HlsConfig } from '../hls';
+import type {
   FragLoadedData,
   LevelLoadedData,
   PartsLoadedData,
   TrackLoadedData,
 } from '../types/events';
-import { HlsConfig } from '../hls';
-import { logger } from '../utils/logger';
-import FetchLoader from '../utils/fetch-loader';
+import type FetchLoader from '../utils/fetch-loader';
 
 export const enum FragRequestState {
   IDLE,

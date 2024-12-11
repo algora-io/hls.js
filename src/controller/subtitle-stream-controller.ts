@@ -1,35 +1,40 @@
-import { Events } from '../events';
-import { Bufferable, BufferHelper } from '../utils/buffer-helper';
-import { findFragmentByPTS } from './fragment-finders';
-import { alignMediaPlaylistByPDT } from '../utils/discontinuities';
-import { addSliding } from '../utils/level-helper';
-import { FragmentState } from './fragment-tracker';
 import BaseStreamController, { State } from './base-stream-controller';
-import { PlaylistLevelType } from '../types/loader';
-import { Level } from '../types/level';
-import { subtitleOptionsIdentical } from '../utils/media-option-attributes';
+import { findFragmentByPTS } from './fragment-finders';
+import { FragmentState } from './fragment-tracker';
 import { ErrorDetails, ErrorTypes } from '../errors';
+import { Events } from '../events';
 import {
-  isFullSegmentEncryption,
+  type Fragment,
+  isMediaFragment,
+  type MediaFragment,
+} from '../loader/fragment';
+import { Level } from '../types/level';
+import { PlaylistLevelType } from '../types/loader';
+import { BufferHelper } from '../utils/buffer-helper';
+import { alignMediaPlaylistByPDT } from '../utils/discontinuities';
+import {
   getAesModeFromFullSegmentMethod,
+  isFullSegmentEncryption,
 } from '../utils/encryption-methods-util';
-import type { NetworkComponentAPI } from '../types/component-api';
-import type Hls from '../hls';
+import { addSliding } from '../utils/level-helper';
+import { subtitleOptionsIdentical } from '../utils/media-option-attributes';
 import type { FragmentTracker } from './fragment-tracker';
+import type Hls from '../hls';
 import type KeyLoader from '../loader/key-loader';
 import type { LevelDetails } from '../loader/level-details';
-import type { Fragment, MediaFragment } from '../loader/fragment';
+import type { NetworkComponentAPI } from '../types/component-api';
 import type {
+  BufferFlushingData,
   ErrorData,
   FragLoadedData,
+  LevelLoadedData,
+  MediaDetachingData,
   SubtitleFragProcessed,
   SubtitleTracksUpdatedData,
   TrackLoadedData,
   TrackSwitchedData,
-  BufferFlushingData,
-  LevelLoadedData,
-  FragBufferedData,
 } from '../types/events';
+import type { Bufferable } from '../utils/buffer-helper';
 
 const TICK_INTERVAL = 500; // how often to tick in ms
 
@@ -76,7 +81,6 @@ export class SubtitleStreamController
     hls.on(Events.SUBTITLE_TRACK_LOADED, this.onSubtitleTrackLoaded, this);
     hls.on(Events.SUBTITLE_FRAG_PROCESSED, this.onSubtitleFragProcessed, this);
     hls.on(Events.BUFFER_FLUSHING, this.onBufferFlushing, this);
-    hls.on(Events.FRAG_BUFFERED, this.onFragBuffered, this);
   }
 
   protected unregisterListeners() {
@@ -88,7 +92,6 @@ export class SubtitleStreamController
     hls.off(Events.SUBTITLE_TRACK_LOADED, this.onSubtitleTrackLoaded, this);
     hls.off(Events.SUBTITLE_FRAG_PROCESSED, this.onSubtitleFragProcessed, this);
     hls.off(Events.BUFFER_FLUSHING, this.onBufferFlushing, this);
-    hls.off(Events.FRAG_BUFFERED, this.onFragBuffered, this);
   }
 
   startLoad(startPosition: number) {
@@ -110,9 +113,12 @@ export class SubtitleStreamController
     this.mainDetails = null;
   }
 
-  protected onMediaDetaching(): void {
+  protected onMediaDetaching(
+    event: Events.MEDIA_DETACHING,
+    data: MediaDetachingData,
+  ) {
     this.tracksBuffered = [];
-    super.onMediaDetaching();
+    super.onMediaDetaching(event, data);
   }
 
   private onLevelLoaded(event: Events.LEVEL_LOADED, data: LevelLoadedData) {
@@ -124,8 +130,8 @@ export class SubtitleStreamController
     data: SubtitleFragProcessed,
   ) {
     const { frag, success } = data;
-    if (frag.sn !== 'initSegment') {
-      this.fragPrevious = frag as MediaFragment;
+    if (isMediaFragment(frag)) {
+      this.fragPrevious = frag;
     }
     this.state = State.IDLE;
     if (!success) {
@@ -160,6 +166,9 @@ export class SubtitleStreamController
     }
     this.fragmentTracker.fragBuffered(frag as MediaFragment);
     this.fragBufferedComplete(frag, null);
+    if (this.media) {
+      this.tick();
+    }
   }
 
   private onBufferFlushing(
@@ -191,14 +200,6 @@ export class SubtitleStreamController
         endOffsetSubtitles,
         PlaylistLevelType.SUBTITLE,
       );
-    }
-  }
-
-  private onFragBuffered(event: Events.FRAG_BUFFERED, data: FragBufferedData) {
-    if (!this.loadedmetadata && data.frag.type === PlaylistLevelType.MAIN) {
-      if (this.media?.buffered.length) {
-        this.loadedmetadata = true;
-      }
     }
   }
 
@@ -303,7 +304,7 @@ export class SubtitleStreamController
       if (!track.details) {
         if (newDetails.hasProgramDateTime && mainDetails.hasProgramDateTime) {
           alignMediaPlaylistByPDT(newDetails, mainDetails);
-          sliding = newDetails.fragments[0].start;
+          sliding = newDetails.fragmentStart;
         } else if (mainSlidingStartFragment) {
           // line up live playlist with main so that fragments in range are loaded
           sliding = mainSlidingStartFragment.start;
@@ -329,9 +330,11 @@ export class SubtitleStreamController
       return;
     }
 
-    if (!this.startFragRequested && (this.mainDetails || !newDetails.live)) {
-      this.setStartPosition(this.mainDetails || newDetails, sliding);
-    }
+    this.hls.trigger(Events.SUBTITLE_TRACK_UPDATED, {
+      details: newDetails,
+      id: trackId,
+      groupId: data.groupId,
+    });
 
     // trigger handler right now
     this.tick();
@@ -422,6 +425,9 @@ export class SubtitleStreamController
       if (!track || !levels.length || !track.details) {
         return;
       }
+      if (this.waitForLive(track)) {
+        return;
+      }
       const { config } = this;
       const currentTime = this.getLoadPosition();
       const bufferedInfo = BufferHelper.bufferedInfo(
@@ -467,7 +473,7 @@ export class SubtitleStreamController
         return;
       }
       foundFrag = this.mapToInitFragWhenRequired(foundFrag) as Fragment;
-      if (foundFrag.sn !== 'initSegment') {
+      if (isMediaFragment(foundFrag)) {
         // Load earlier fragment in same discontinuity to make up for misaligned playlists and cues that extend beyond end of segment
         const curSNIdx = foundFrag.sn - trackDetails.startSN;
         const prevFrag = fragments[curSNIdx - 1];
@@ -493,7 +499,7 @@ export class SubtitleStreamController
     level: Level,
     targetBufferTime: number,
   ) {
-    if (frag.sn === 'initSegment') {
+    if (!isMediaFragment(frag)) {
       this._loadInitSegment(frag, level);
     } else {
       super.loadFragment(frag, level, targetBufferTime);

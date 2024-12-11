@@ -1,10 +1,10 @@
 import AESCrypto from './aes-crypto';
-import FastAESKey from './fast-aes-key';
 import AESDecryptor, { removePadding } from './aes-decryptor';
+import { DecrypterAesMode } from './decrypter-aes-mode';
+import FastAESKey from './fast-aes-key';
 import { logger } from '../utils/logger';
 import { appendUint8Array } from '../utils/mp4-tools';
 import { sliceUint8 } from '../utils/typed-array';
-import { DecrypterAesMode } from './decrypter-aes-mode';
 import type { HlsConfig } from '../config';
 
 const CHUNK_SIZE = 16; // 16 bytes, 128 bits
@@ -86,7 +86,8 @@ export default class Decrypter {
   ): Promise<ArrayBuffer> {
     if (this.useSoftware) {
       return new Promise((resolve, reject) => {
-        this.softwareDecrypt(new Uint8Array(data), key, iv, aesMode);
+        const dataView = ArrayBuffer.isView(data) ? data : new Uint8Array(data);
+        this.softwareDecrypt(dataView, key, iv, aesMode);
         const decryptResult = this.flush();
         if (decryptResult) {
           resolve(decryptResult.buffer);

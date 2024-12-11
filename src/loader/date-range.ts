@@ -1,6 +1,6 @@
 import { AttrList } from '../utils/attr-list';
 import { logger } from '../utils/logger';
-import type { Fragment } from './fragment';
+import type { MediaFragmentRef } from './fragment';
 
 // Avoid exporting const enum so that these values can be inlined
 const enum DateRangeAttribute {
@@ -47,10 +47,11 @@ export function isSCTE35Attribute(attrName: string): boolean {
 
 export class DateRange {
   public attr: AttrList;
-  public tagAnchor: Fragment | null;
+  public tagAnchor: MediaFragmentRef | null;
   public tagOrder: number;
   private _startDate: Date;
   private _endDate?: Date;
+  private _dateAtEnd?: Date;
   private _cue?: DateRangeCue;
   private _badValueForSameId?: string;
 
@@ -83,9 +84,14 @@ export class DateRange {
       );
     }
     this.attr = dateRangeAttr;
-    this._startDate = dateRangeWithSameId
-      ? dateRangeWithSameId.startDate
-      : new Date(dateRangeAttr[DateRangeAttribute.START_DATE]);
+    if (dateRangeWithSameId) {
+      this._startDate = dateRangeWithSameId._startDate;
+      this._cue = dateRangeWithSameId._cue;
+      this._endDate = dateRangeWithSameId._endDate;
+      this._dateAtEnd = dateRangeWithSameId._dateAtEnd;
+    } else {
+      this._startDate = new Date(dateRangeAttr[DateRangeAttribute.START_DATE]);
+    }
     if (DateRangeAttribute.END_DATE in this.attr) {
       const endDate =
         dateRangeWithSameId?.endDate ||
@@ -139,12 +145,15 @@ export class DateRange {
   }
 
   get endDate(): Date | null {
-    if (this._endDate) {
-      return this._endDate;
+    const dateAtEnd = this._endDate || this._dateAtEnd;
+    if (dateAtEnd) {
+      return dateAtEnd;
     }
     const duration = this.duration;
     if (duration !== null) {
-      return new Date(this._startDate.getTime() + duration * 1000);
+      return (this._dateAtEnd = new Date(
+        this._startDate.getTime() + duration * 1000,
+      ));
     }
     return null;
   }

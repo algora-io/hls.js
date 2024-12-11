@@ -3,24 +3,22 @@
  *
  * DRM support for Hls.js
  */
+import { EventEmitter } from 'eventemitter3';
+import { ErrorDetails, ErrorTypes } from '../errors';
 import { Events } from '../events';
-import { ErrorTypes, ErrorDetails } from '../errors';
+import { LevelKey } from '../loader/level-key';
+import Hex from '../utils/hex';
 import { Logger } from '../utils/logger';
 import {
   getKeySystemsForConfig,
   getSupportedMediaKeySystemConfigurations,
-  keySystemDomainToKeySystemFormat as keySystemToKeySystemFormat,
-  KeySystemFormats,
   keySystemFormatToKeySystemDomain,
   keySystemIdToKeySystemDomain,
   KeySystems,
-  requestMediaKeySystemAccess,
+  keySystemDomainToKeySystemFormat as keySystemToKeySystemFormat,
   parsePlayReadyWRM,
+  requestMediaKeySystemAccess,
 } from '../utils/mediakeys-helper';
-import { strToUtf8array } from '../utils/utf8-utils';
-import { base64Decode } from '../utils/numeric-encoding-utils';
-import { DecryptData, LevelKey } from '../loader/level-key';
-import Hex from '../utils/hex';
 import {
   bin2str,
   parseMultiPssh,
@@ -28,23 +26,26 @@ import {
   type PsshData,
   type PsshInvalidResult,
 } from '../utils/mp4-tools';
-import { EventEmitter } from 'eventemitter3';
+import { base64Decode } from '../utils/numeric-encoding-utils';
+import { strToUtf8array } from '../utils/utf8-utils';
+import type { EMEControllerConfig, HlsConfig, LoadPolicy } from '../config';
 import type Hls from '../hls';
+import type { Fragment } from '../loader/fragment';
+import type { DecryptData } from '../loader/level-key';
 import type { ComponentAPI } from '../types/component-api';
 import type {
-  MediaAttachedData,
-  KeyLoadedData,
   ErrorData,
+  KeyLoadedData,
   ManifestLoadedData,
+  MediaAttachedData,
 } from '../types/events';
-import type { EMEControllerConfig, HlsConfig, LoadPolicy } from '../config';
-import type { Fragment } from '../loader/fragment';
 import type {
   Loader,
   LoaderCallbacks,
   LoaderConfiguration,
   LoaderContext,
 } from '../types/loader';
+import type { KeySystemFormats } from '../utils/mediakeys-helper';
 interface KeySystemAccessPromises {
   keySystemAccess: Promise<MediaKeySystemAccess>;
   mediaKeys?: Promise<MediaKeys>;
@@ -346,7 +347,7 @@ class EMEController extends Logger implements ComponentAPI {
         this.generateRequestWithPreferredKeySession(
           keySessionContext,
           scheme,
-          decryptdata.pssh,
+          decryptdata.pssh.buffer,
           'expired',
         );
     } else {
@@ -425,38 +426,42 @@ class EMEController extends Logger implements ComponentAPI {
 
     this.log(`Starting session for key ${keyDetails}`);
 
-    let keySessionContextPromise = this.keyIdToKeySessionPromise[keyId];
-    if (!keySessionContextPromise) {
-      keySessionContextPromise = this.keyIdToKeySessionPromise[keyId] =
-        this.getKeySystemForKeyPromise(decryptdata).then(
-          ({ keySystem, mediaKeys }) => {
-            this.throwIfDestroyed();
-            this.log(
-              `Handle encrypted media sn: ${data.frag.sn} ${data.frag.type}: ${data.frag.level} using key ${keyDetails}`,
-            );
+    let keyContextPromise = this.keyIdToKeySessionPromise[keyId];
+    if (!keyContextPromise) {
+      keyContextPromise = this.getKeySystemForKeyPromise(decryptdata).then(
+        ({ keySystem, mediaKeys }) => {
+          this.throwIfDestroyed();
+          this.log(
+            `Handle encrypted media sn: ${data.frag.sn} ${data.frag.type}: ${data.frag.level} using key ${keyDetails}`,
+          );
 
-            return this.attemptSetMediaKeys(keySystem, mediaKeys).then(() => {
-              this.throwIfDestroyed();
-              const keySessionContext = this.createMediaKeySessionContext({
-                keySystem,
-                mediaKeys,
-                decryptdata,
-              });
-              const scheme = 'cenc';
-              return this.generateRequestWithPreferredKeySession(
-                keySessionContext,
-                scheme,
-                decryptdata.pssh,
-                'playlist-key',
-              );
+          return this.attemptSetMediaKeys(keySystem, mediaKeys).then(() => {
+            this.throwIfDestroyed();
+            return this.createMediaKeySessionContext({
+              keySystem,
+              mediaKeys,
+              decryptdata,
             });
-          },
-        );
+          });
+        },
+      );
+
+      const keySessionContextPromise = (this.keyIdToKeySessionPromise[keyId] =
+        keyContextPromise.then((keySessionContext) => {
+          const scheme = 'cenc';
+          const initData = decryptdata.pssh ? decryptdata.pssh.buffer : null;
+          return this.generateRequestWithPreferredKeySession(
+            keySessionContext,
+            scheme,
+            initData,
+            'playlist-key',
+          );
+        }));
 
       keySessionContextPromise.catch((error) => this.handleError(error));
     }
 
-    return keySessionContextPromise;
+    return keyContextPromise;
   }
 
   private throwIfDestroyed(message = 'Invalid state'): void | never {
@@ -541,7 +546,7 @@ class EMEController extends Logger implements ComponentAPI {
       const json = bin2str(new Uint8Array(initData));
       try {
         const sinf = base64Decode(JSON.parse(json).sinf);
-        const tenc = parseSinf(new Uint8Array(sinf));
+        const tenc = parseSinf(sinf);
         if (!tenc) {
           throw new Error(
             `'schm' box missing or not cbcs/cenc with schi > tenc`,
@@ -635,6 +640,7 @@ class EMEController extends Logger implements ComponentAPI {
               'encrypted-event-key-match',
             );
           });
+        keySessionContextPromise.catch((error) => this.handleError(error));
         break;
       }
     }
@@ -668,8 +674,8 @@ class EMEController extends Logger implements ComponentAPI {
             });
           },
         );
+      keySessionContextPromise.catch((error) => this.handleError(error));
     }
-    keySessionContextPromise.catch((error) => this.handleError(error));
   };
 
   private onWaitingForKey = (event: Event) => {
@@ -725,9 +731,8 @@ class EMEController extends Logger implements ComponentAPI {
           );
         }
         initDataType = mappedInitData.initDataType;
-        initData = context.decryptdata.pssh = mappedInitData.initData
-          ? new Uint8Array(mappedInitData.initData)
-          : null;
+        initData = mappedInitData.initData ? mappedInitData.initData : null;
+        context.decryptdata.pssh = initData ? new Uint8Array(initData) : null;
       } catch (error) {
         this.warn(error.message);
         if (this.hls?.config.debug) {
@@ -765,8 +770,11 @@ class EMEController extends Logger implements ComponentAPI {
         messageType === 'license-renewal'
       ) {
         this.renewLicense(context, message).catch((error) => {
-          this.handleError(error);
-          licenseStatus.emit('error', error);
+          if (licenseStatus.eventNames().length) {
+            licenseStatus.emit('error', error);
+          } else {
+            this.handleError(error);
+          }
         });
       } else if (messageType === 'license-release') {
         if (context.keySystem === KeySystems.FAIRPLAY) {
@@ -1227,6 +1235,8 @@ class EMEController extends Logger implements ComponentAPI {
     // keep reference of media
     this.media = media;
 
+    media.removeEventListener('encrypted', this.onMediaEncrypted);
+    media.removeEventListener('waitingforkey', this.onWaitingForKey);
     media.addEventListener('encrypted', this.onMediaEncrypted);
     media.addEventListener('waitingforkey', this.onWaitingForKey);
   }
@@ -1254,8 +1264,14 @@ class EMEController extends Logger implements ComponentAPI {
           this.removeSession(mediaKeySessionContext),
         )
         .concat(
-          media?.setMediaKeys(null).catch((error) => {
+          media?.setMediaKeys(null)?.catch((error) => {
             this.log(`Could not clear media keys: ${error}`);
+            this.hls?.trigger(Events.ERROR, {
+              type: ErrorTypes.OTHER_ERROR,
+              details: ErrorDetails.KEY_SYSTEM_DESTROY_MEDIA_KEYS_ERROR,
+              fatal: false,
+              error: new Error(`Could not clear media keys: ${error}`),
+            });
           }),
         ),
     )
@@ -1267,6 +1283,14 @@ class EMEController extends Logger implements ComponentAPI {
       })
       .catch((error) => {
         this.log(`Could not close sessions and clear media keys: ${error}`);
+        this.hls?.trigger(Events.ERROR, {
+          type: ErrorTypes.OTHER_ERROR,
+          details: ErrorDetails.KEY_SYSTEM_DESTROY_CLOSE_SESSION_ERROR,
+          fatal: false,
+          error: new Error(
+            `Could not close sessions and clear media keys: ${error}`,
+          ),
+        });
       });
   }
 
@@ -1338,12 +1362,24 @@ class EMEController extends Logger implements ComponentAPI {
         .remove()
         .catch((error) => {
           this.log(`Could not remove session: ${error}`);
+          this.hls?.trigger(Events.ERROR, {
+            type: ErrorTypes.OTHER_ERROR,
+            details: ErrorDetails.KEY_SYSTEM_DESTROY_REMOVE_SESSION_ERROR,
+            fatal: false,
+            error: new Error(`Could not remove session: ${error}`),
+          });
         })
         .then(() => {
           return mediaKeysSession.close();
         })
         .catch((error) => {
           this.log(`Could not close session: ${error}`);
+          this.hls?.trigger(Events.ERROR, {
+            type: ErrorTypes.OTHER_ERROR,
+            details: ErrorDetails.KEY_SYSTEM_DESTROY_CLOSE_SESSION_ERROR,
+            fatal: false,
+            error: new Error(`Could not close session: ${error}`),
+          });
         });
     }
   }
